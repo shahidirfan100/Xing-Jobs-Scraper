@@ -1,0 +1,69 @@
+{
+  "title": "Xing Jobs Scraper",
+  "description": "Extract job listings from Xing.com with detailed information. Search by keyword, location, and discipline, or provide a direct Xing jobs search URL. The scraper retrieves job titles, company names, locations, salaries, employment types, and full descriptions.",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "startUrl": {
+      "title": "Start URL",
+      "type": "string",
+      "description": "Start scraping from a specific Xing jobs search URL (e.g., https://www.xing.com/jobs/t-remote?keywords=Remote). If provided, this will override Keyword/Location/Discipline filters.",
+      "editor": "textfield"
+    },
+    "keyword": {
+      "title": "Keyword",
+      "type": "string",
+      "description": "Job search keyword or title, e.g., 'Remote', 'Software Developer', 'Project Manager', 'Data Analyst'.",
+      "editor": "textfield",
+      "prefill": "Remote"
+    },
+    "location": {
+      "title": "Location",
+      "type": "string",
+      "description": "City or region to filter jobs by location, e.g., 'Berlin', 'Munich', 'Hamburg'. Leave empty for all locations.",
+      "editor": "textfield"
+    },
+    "collectDetails": {
+      "title": "Collect job details",
+      "type": "boolean",
+      "description": "Enable this to visit each job detail page and extract complete job descriptions, salary information, and employment type details.",
+      "editor": "checkbox",
+      "default": true
+    },
+    "results_wanted": {
+      "title": "Maximum number of jobs",
+      "type": "integer",
+      "description": "The maximum number of job listings to collect. Set to a specific number to limit results or leave at default for comprehensive scraping.",
+      "minimum": 1,
+      "default": 100,
+      "editor": "number"
+    },
+    "max_pages": {
+      "title": "Maximum number of pages",
+      "type": "integer",
+      "description": "Safety limit on the number of search result pages to visit. Prevents excessive scraping on large result sets.",
+      "minimum": 1,
+      "editor": "number",
+      "default": 20
+    },
+    "proxyConfiguration": {
+      "title": "Proxy configuration",
+      "type": "object",
+      "description": "Configure proxy settings for the scraper. Residential proxies are recommended for reliable access to Xing.com.",
+      "editor": "proxy",
+      "default": {
+        "useApifyProxy": true,
+        "apifyProxyGroups": ["RESIDENTIAL"]
+      }
+    },
+    "dedupe": {
+      "title": "Deduplicate results",
+      "type": "boolean",
+      "description": "Automatically remove duplicate job URLs from results using in-memory deduplication.",
+      "editor": "checkbox",
+      "default": true
+    }
+  },
+  "required": [],
+  "additionalProperties": false
+}

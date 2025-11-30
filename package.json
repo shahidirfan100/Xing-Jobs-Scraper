@@ -1,0 +1,17 @@
+{
+  "name": "xing-jobs-scraper",
+  "version": "1.0.0",
+  "description": "Powerful Xing.com jobs scraper for extracting job listings with detailed information including salary, location, and job type.",
+  "type": "module",
+  "scripts": {
+    "start": "node src/main.js"
+  },
+  "dependencies": {
+    "apify": "^3.4.5",
+    "crawlee": "^3.14.1",
+    "cheerio": "^1.0.0-rc.12",
+    "got-scraping": "^4.1.2",
+    "jsdom": "^27.1.0",
+    "header-generator": "^2.1.27"
+  }
+}
