@@ -11,7 +11,7 @@ Actor.main(async () => {
         keyword = '',
         location = '',
         discipline = '',
-        results_wanted: RESULTS_WANTED_RAW = 20,
+        results_wanted: RESULTS_WANTED_RAW = 100,
         max_pages: MAX_PAGES_RAW = 50,
         collectDetails = true,
         startUrl,
@@ -48,6 +48,7 @@ Actor.main(async () => {
     let globalBackoffMs = 0;
     let consecutiveSuccesses = 0;
     let saved = 0;
+    let enqueuedDetailPages = 0;
 
     // Detect proxy type for optimization
     const isDatacenterProxy = !proxyConfiguration?.apifyProxyGroups?.includes('RESIDENTIAL');
@@ -403,12 +404,6 @@ Actor.main(async () => {
             const label = request.userData?.label || 'LIST';
             const pageNo = request.userData?.pageNo || 1;
 
-            // Early exit if quota reached
-            if (saved >= RESULTS_WANTED) {
-                crawlerLog.info(`✅ Quota reached (${saved}/${RESULTS_WANTED}), skipping ${request.url}`);
-                return;
-            }
-
             // ====================
             // LIST PAGE HANDLER
             // ====================
@@ -421,7 +416,8 @@ Actor.main(async () => {
                 );
 
                 if (collectDetails) {
-                    const remaining = RESULTS_WANTED - saved;
+                    // Use enqueuedDetailPages instead of saved to prevent race condition
+                    const remaining = RESULTS_WANTED - enqueuedDetailPages;
                     const toEnqueue = links.slice(0, Math.max(0, remaining));
                     
                     if (toEnqueue.length > 0) {
@@ -429,7 +425,8 @@ Actor.main(async () => {
                             urls: toEnqueue,
                             userData: { label: 'DETAIL' },
                         });
-                        crawlerLog.info(`➕ Enqueued ${toEnqueue.length} detail pages`);
+                        enqueuedDetailPages += toEnqueue.length;
+                        crawlerLog.info(`➕ Enqueued ${toEnqueue.length} detail pages (Total enqueued: ${enqueuedDetailPages}/${RESULTS_WANTED}, Saved: ${saved})`);
                     }
                 } else {
                     // Save URLs only without details
@@ -450,20 +447,22 @@ Actor.main(async () => {
                     }
                 }
 
-                // Pagination with smart stopping
-                if (saved < RESULTS_WANTED && pageNo < MAX_PAGES) {
+                // Pagination with smart stopping - use enqueued count instead of saved
+                const needsMoreJobs = collectDetails ? (enqueuedDetailPages < RESULTS_WANTED) : (saved < RESULTS_WANTED);
+                
+                if (needsMoreJobs && pageNo < MAX_PAGES) {
                     const next = findNextPage($, request.url);
                     if (next) {
                         await enqueueLinks({
                             urls: [next],
                             userData: { label: 'LIST', pageNo: pageNo + 1 },
                         });
-                        crawlerLog.info(`➡️ Next page enqueued: Page ${pageNo + 1}`);
+                        crawlerLog.info(`➡️ Next page enqueued: Page ${pageNo + 1} (Enqueued: ${enqueuedDetailPages}, Saved: ${saved})`);
                     } else {
                         crawlerLog.info(`🏁 No more pages found. Stopping pagination.`);
                     }
                 } else {
-                    crawlerLog.info(`🛑 Stopping pagination: saved=${saved}, pageNo=${pageNo}`);
+                    crawlerLog.info(`🛑 Stopping pagination: enqueued=${enqueuedDetailPages}, saved=${saved}, pageNo=${pageNo}, maxPages=${MAX_PAGES}`);
                 }
 
                 return;
@@ -473,7 +472,11 @@ Actor.main(async () => {
             // DETAIL PAGE HANDLER
             // ====================
             if (label === 'DETAIL') {
-                if (saved >= RESULTS_WANTED) return;
+                // Check quota before processing
+                if (saved >= RESULTS_WANTED) {
+                    crawlerLog.info(`✅ Quota reached (${saved}/${RESULTS_WANTED}), skipping detail page`);
+                    return;
+                }
 
                 stats.detailPagesProcessed++;
 
