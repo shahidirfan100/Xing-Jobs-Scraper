@@ -1,13 +1,8 @@
-// Xing Jobs scraper - CheerioCrawler (production-grade)
-//
-// - Concurrency: min 8, max 13, desired 10
-// - Adaptive backoff for 429/403/503 (blocking / rate limiting)
-// - Clean salary parsing
-// - Extracts: salary, job_type, remote, job_category
-// - Uses Actor.main + Crawlee.sleep (QA-friendly)
+// Xing Jobs Scraper - Production-Grade (Fast + Stealthy)
+// Optimized for datacenter proxies with adaptive stealth features
 
 import { Actor, log } from 'apify';
-import { CheerioCrawler, Dataset, sleep } from 'crawlee';
+import { CheerioCrawler, Dataset, sleep, RequestQueue, KeyValueStore } from 'crawlee';
 import { load as cheerioLoad } from 'cheerio';
 
 Actor.main(async () => {
@@ -25,18 +20,43 @@ Actor.main(async () => {
         proxyConfiguration,
     } = input;
 
-    log.info('Actor input', { keyword, location, discipline, RESULTS_WANTED_RAW, MAX_PAGES_RAW });
+    log.info('🚀 Xing Jobs Scraper Starting', { 
+        keyword, location, discipline, 
+        results_wanted: RESULTS_WANTED_RAW, 
+        max_pages: MAX_PAGES_RAW 
+    });
 
     const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW)
         ? Math.max(1, +RESULTS_WANTED_RAW)
         : Number.MAX_SAFE_INTEGER;
 
-    const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW)
-        ? Math.max(1, +MAX_PAGES_RAW)
-        : 50;
+    const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW) ? Math.max(1, +MAX_PAGES_RAW) : 50;
+    const MAX_REQUESTS_PER_CRAWL = Math.min(RESULTS_WANTED * 4, 500);
 
-    // Soft cap on total requests – tighter for speed
-    const MAX_REQUESTS_PER_CRAWL = RESULTS_WANTED * 3 || 150;
+    // Performance tracking
+    const stats = {
+        startTime: Date.now(),
+        listPagesProcessed: 0,
+        detailPagesProcessed: 0,
+        itemsSaved: 0,
+        errors: 0,
+        blockedRequests: 0,
+        averageRequestTime: [],
+    };
+
+    // Adaptive backoff management
+    let globalBackoffMs = 0;
+    let consecutiveSuccesses = 0;
+    let saved = 0;
+
+    // Detect proxy type for optimization
+    const isDatacenterProxy = !proxyConfiguration?.apifyProxyGroups?.includes('RESIDENTIAL');
+    
+    log.info(`🔧 Proxy Mode: ${isDatacenterProxy ? 'DATACENTER (Speed Optimized)' : 'RESIDENTIAL (Stealth Optimized)'}`);
+
+    // ====================
+    // UTILITY FUNCTIONS
+    // ====================
 
     const toAbs = (href, base = 'https://www.xing.com') => {
         try {
@@ -58,44 +78,31 @@ Actor.main(async () => {
         return String(str).replace(/\s+/g, ' ').trim() || null;
     };
 
-    // --- Salary parser: strips noise, keeps readable values ---
+    // Enhanced salary parser
     const parseSalaryText = (raw) => {
         if (!raw) return null;
-
         let text = String(raw).replace(/\s+/g, ' ').trim();
-
-        // Strip everything before first currency sign
+        
         const firstCurrencyIndex = text.search(/[€£$]/);
         if (firstCurrencyIndex > 0) {
             text = text.slice(firstCurrencyIndex).trim();
         }
 
         const matches = text.match(/[€£$]\s?\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?/g);
-        if (!matches || !matches.length) {
-            return text; // last-resort fallback
-        }
+        if (!matches || !matches.length) return text;
 
         const uniques = Array.from(new Set(matches));
-
         if (uniques.length === 1) return uniques[0];
-
-        if (uniques.length === 2) {
-            const [min, max] = uniques;
-            return `${min}–${max}`;
-        }
-
-        // 3+ amounts: assume [avg, min, max]
-        const avg = uniques[0];
-        const min = uniques[1];
-        const max = uniques[uniques.length - 1];
-        return `${avg} avg, range ${min}–${max}`;
+        if (uniques.length === 2) return `${uniques[0]} – ${uniques[1]}`;
+        
+        return `${uniques[0]} (avg), range ${uniques[1]} – ${uniques[uniques.length - 1]}`;
     };
 
     const buildStartUrl = (kw, loc, disc) => {
         let path = '/jobs';
         if (kw) {
             path += `/t-${encodeURIComponent(
-                String(kw).trim().toLowerCase().replace(/\s+/g, '-'),
+                String(kw).trim().toLowerCase().replace(/\s+/g, '-')
             )}`;
         }
         const u = new URL(path, 'https://www.xing.com');
@@ -105,22 +112,17 @@ Actor.main(async () => {
         return u.href;
     };
 
-    const initial = [];
-    if (Array.isArray(startUrls) && startUrls.length) initial.push(...startUrls);
-    if (startUrl) initial.push(startUrl);
-    if (url) initial.push(url);
-    if (!initial.length) initial.push(buildStartUrl(keyword, location, discipline));
+    // Smart URL validation - filters out non-job URLs early
+    const isValidJobUrl = (url) => {
+        if (!url) return false;
+        // Xing job URLs: /jobs/[location-or-homeoffice]-[title]-[numeric-id]
+        return /\/jobs\/[a-z0-9-]+-\d{6,}/i.test(url);
+    };
 
-    const proxyConf = proxyConfiguration
-        ? await Actor.createProxyConfiguration({ ...proxyConfiguration })
-        : undefined;
+    // ====================
+    // DATA EXTRACTION
+    // ====================
 
-    let saved = 0;
-
-    // For adaptive backoff: simple shared backoff state
-    let globalBackoffMs = 0;
-
-    // ----- JSON-LD extraction -----
     const extractFromJsonLd = ($) => {
         const scripts = $('script[type="application/ld+json"]');
         for (let i = 0; i < scripts.length; i++) {
@@ -141,17 +143,11 @@ Actor.main(async () => {
                             date_posted: e.datePosted || null,
                             description_html: e.description || null,
                             location:
-                                (e.jobLocation &&
-                                    e.jobLocation.address &&
-                                    (e.jobLocation.address.addressLocality ||
-                                        e.jobLocation.address.addressRegion)) ||
-                                null,
-                            salary: e.baseSalary
-                                ? e.baseSalary.value?.value ||
-                                  e.baseSalary.minValue ||
-                                  e.baseSalary.maxValue ||
-                                  null
-                                : null,
+                                (e.jobLocation?.address?.addressLocality ||
+                                 e.jobLocation?.address?.addressRegion) || null,
+                            salary: e.baseSalary?.value?.value ||
+                                    e.baseSalary?.minValue ||
+                                    e.baseSalary?.maxValue || null,
                             job_type: e.employmentType || null,
                             remote_type: e.jobLocationType || null,
                             job_category: null,
@@ -159,33 +155,35 @@ Actor.main(async () => {
                     }
                 }
             } catch {
-                // ignore JSON-LD parsing errors
+                // Ignore JSON-LD parsing errors
             }
         }
         return null;
     };
 
-    // ----- LIST page helpers -----
     const findJobLinks = ($, base) => {
         const links = new Set();
-
-        // Restrict to likely job links for speed & fewer useless requests
-        $('a[href*="/jobs/"]').each((_, a) => {
-            const href = $(a).attr('href');
+        
+        // More specific selector for performance
+        $('a[href*="/jobs/"]').each((_, el) => {
+            const href = $(el).attr('href');
             if (!href) return;
-            if (!/\/jobs\/[a-z0-9-]+-\d+/i.test(href)) return;
-
+            
             const abs = toAbs(href, base);
-            if (abs) links.add(abs);
+            if (abs && isValidJobUrl(abs)) {
+                links.add(abs);
+            }
         });
 
         return [...links];
     };
 
     const findNextPage = ($, base) => {
-        const showMore = $('button')
-            .filter((_, el) => /show\s+more/i.test($(el).text()))
-            .first();
+        // Check for "Show more" button
+        const showMore = $('button').filter((_, el) => 
+            /show\s+more/i.test($(el).text())
+        ).first();
+        
         if (showMore.length) {
             const currentUrl = new URL(base);
             const currentPage = parseInt(currentUrl.searchParams.get('page') || '1', 10);
@@ -193,151 +191,266 @@ Actor.main(async () => {
             return currentUrl.href;
         }
 
-        const nextLink = $('a[aria-label*="Next"], a[rel="next"]').first();
+        // Check for pagination links
+        const nextLink = $('a[aria-label*="Next" i], a[rel="next"]').first();
         if (nextLink.length) {
-            const abs = toAbs(nextLink.attr('href'), base);
-            if (abs) return abs;
+            return toAbs(nextLink.attr('href'), base);
         }
 
         return null;
     };
 
-    // ----- Stealth: UA rotation -----
+    // ====================
+    // STEALTH FEATURES
+    // ====================
+
     const USER_AGENTS = [
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
-        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15',
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
     ];
-    const pickRandomUserAgent = () =>
-        USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+
+    const ACCEPT_LANGUAGES = [
+        'en-US,en;q=0.9',
+        'en-GB,en;q=0.9',
+        'de-DE,de;q=0.9,en;q=0.8',
+        'en-US,en;q=0.9,de;q=0.8',
+    ];
+
+    const pickRandomUserAgent = () => USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+    const pickRandomAcceptLang = () => ACCEPT_LANGUAGES[Math.floor(Math.random() * ACCEPT_LANGUAGES.length)];
+
+    // ====================
+    // SETUP
+    // ====================
+
+    const initial = [];
+    if (Array.isArray(startUrls) && startUrls.length) initial.push(...startUrls);
+    if (startUrl) initial.push(startUrl);
+    if (url) initial.push(url);
+    if (!initial.length) initial.push(buildStartUrl(keyword, location, discipline));
+
+    const proxyConf = proxyConfiguration
+        ? await Actor.createProxyConfiguration({ ...proxyConfiguration })
+        : undefined;
+
+    const requestQueue = await RequestQueue.open();
+    const kvStore = await KeyValueStore.open();
+
+    // Load previous state if exists (for resume capability)
+    const previousState = await kvStore.getValue('STATE');
+    if (previousState) {
+        saved = previousState.saved || 0;
+        stats.itemsSaved = saved;
+        log.info(`📦 Resuming from previous state: ${saved} items already saved`);
+    }
+
+    // Enqueue initial URLs
+    for (const u of initial) {
+        await requestQueue.addRequest({ 
+            url: u, 
+            userData: { label: 'LIST', pageNo: 1 } 
+        });
+    }
+
+    // ====================
+    // CRAWLER CONFIGURATION
+    // ====================
 
     const crawler = new CheerioCrawler({
+        requestQueue,
         proxyConfiguration: proxyConf,
-        maxRequestRetries: 2, // fewer retries -> faster, but with adaptive backoff
+        
+        // Optimized for datacenter proxies
+        maxRequestRetries: isDatacenterProxy ? 2 : 3,
+        maxRequestsPerCrawl: MAX_REQUESTS_PER_CRAWL,
+        requestHandlerTimeoutSecs: isDatacenterProxy ? 20 : 30,
+        
+        // Session management
         useSessionPool: true,
         sessionPoolOptions: {
-            maxPoolSize: 40,
+            maxPoolSize: isDatacenterProxy ? 50 : 100,
             sessionOptions: {
-                maxUsageCount: 40,
+                maxUsageCount: isDatacenterProxy ? 30 : 50,
             },
         },
 
-        // Concurrency as per your request
-        minConcurrency: 8,
-        maxConcurrency: 13,
+        // Concurrency: Conservative settings to avoid blocking
+        minConcurrency: isDatacenterProxy ? 8 : 6,
+        maxConcurrency: isDatacenterProxy ? 14 : 12,
         autoscaledPoolOptions: {
-            desiredConcurrency: 10,
+            desiredConcurrency: isDatacenterProxy ? 10 : 8,
+            scaleUpStepRatio: 0.1,
+            scaleDownStepRatio: 0.05,
         },
 
-        maxRequestsPerCrawl: MAX_REQUESTS_PER_CRAWL,
-        requestHandlerTimeoutSecs: 25,
-
-        // Pre-navigation: headers, UA, light jitter + global backoff if we were blocked recently
+        // ====================
+        // PRE-NAVIGATION HOOKS
+        // ====================
         preNavigationHooks: [
-            async ({ session }, gotOptions) => {
-                const ua =
-                    (session && session.userData && session.userData.ua) ||
-                    pickRandomUserAgent();
+            async ({ request, session }, gotOptions) => {
+                const requestStartTime = Date.now();
+                request.userData.requestStartTime = requestStartTime;
 
-                if (session && session.userData && !session.userData.ua) {
+                // Session-based UA persistence
+                const ua = session?.userData?.ua || pickRandomUserAgent();
+                if (session && !session.userData.ua) {
                     session.userData.ua = ua;
                 }
 
+                const acceptLang = session?.userData?.acceptLang || pickRandomAcceptLang();
+                if (session && !session.userData.acceptLang) {
+                    session.userData.acceptLang = acceptLang;
+                }
+
+                // Enhanced headers for stealth
                 gotOptions.headers = {
                     ...(gotOptions.headers || {}),
                     'User-Agent': ua,
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    Accept:
-                        'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                    'Accept-Language': acceptLang,
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'DNT': '1',
+                    'Connection': 'keep-alive',
                     'Upgrade-Insecure-Requests': '1',
-                    'Cache-Control': 'no-cache',
-                    Pragma: 'no-cache',
+                    'Sec-Fetch-Dest': 'document',
+                    'Sec-Fetch-Mode': 'navigate',
+                    'Sec-Fetch-Site': 'none',
+                    'Sec-Fetch-User': '?1',
+                    'Cache-Control': 'max-age=0',
                 };
 
-                // Base jitter
-                const baseDelayMs = 80 + Math.random() * 140;
+                // Add referer for detail pages
+                if (request.userData?.label === 'DETAIL') {
+                    gotOptions.headers['Referer'] = 'https://www.xing.com/jobs';
+                }
 
-                // If we saw blocking recently, add a shared backoff
+                // Adaptive delay based on mode and backoff
+                let delayMs = isDatacenterProxy ? (30 + Math.random() * 70) : (80 + Math.random() * 140);
+                
+                // Apply global backoff if needed
                 if (globalBackoffMs > 0) {
                     await sleep(globalBackoffMs);
-                    // Decay backoff slowly
-                    globalBackoffMs = Math.max(0, globalBackoffMs - 100);
+                    globalBackoffMs = Math.max(0, globalBackoffMs - 50);
                 }
 
-                await sleep(baseDelayMs);
+                await sleep(delayMs);
             },
         ],
 
-        // Post-navigation: inspect response codes and adapt
+        // ====================
+        // POST-NAVIGATION HOOKS
+        // ====================
         postNavigationHooks: [
-            async ({ response, session, log: hookLog }) => {
+            async ({ request, response, session, log: hookLog }) => {
                 if (!response) return;
 
+                // Track request time
+                if (request.userData.requestStartTime) {
+                    const requestTime = Date.now() - request.userData.requestStartTime;
+                    stats.averageRequestTime.push(requestTime);
+                    if (stats.averageRequestTime.length > 100) {
+                        stats.averageRequestTime.shift();
+                    }
+                }
+
                 const status = response.statusCode;
+
+                // Handle blocking/rate limiting
                 if ([403, 429, 503].includes(status)) {
+                    stats.blockedRequests++;
+                    consecutiveSuccesses = 0;
+                    
+                    // Exponential backoff
+                    const backoffIncrease = Math.min(1000 + (stats.blockedRequests * 200), 3000);
+                    globalBackoffMs = Math.min(globalBackoffMs + backoffIncrease, 5000);
+                    
                     hookLog.warning(
-                        `Received status ${status}, applying backoff and retiring session.`,
+                        `⚠️ Status ${status} detected. Backoff: ${globalBackoffMs}ms, Blocked count: ${stats.blockedRequests}`
                     );
-                    // Pump backoff up to max 2 seconds
-                    globalBackoffMs = Math.min(globalBackoffMs + 500, 2000);
 
                     if (session) {
-                        session.markBad();
+                        session.retire();
                     }
 
-                    // Small extra sleep here to cool down a bit more
-                    await sleep(400 + Math.random() * 400);
+                    await sleep(500 + Math.random() * 500);
+                }
+                // Success - reduce backoff
+                else if (status === 200) {
+                    consecutiveSuccesses++;
+                    if (consecutiveSuccesses > 10) {
+                        globalBackoffMs = Math.max(0, globalBackoffMs - 100);
+                        consecutiveSuccesses = 0;
+                    }
                 }
             },
         ],
 
+        // ====================
+        // FAILED REQUEST HANDLER
+        // ====================
         failedRequestHandler: async ({ request, error }) => {
-            log.error(
-                `Request ${request.url} failed too many times. Last error: ${error?.message}`,
-            );
+            stats.errors++;
+            log.error(`❌ Request failed: ${request.url}`, { error: error?.message });
         },
 
+        // ====================
+        // REQUEST HANDLER
+        // ====================
         async requestHandler({ request, $, enqueueLinks, log: crawlerLog }) {
             const label = request.userData?.label || 'LIST';
             const pageNo = request.userData?.pageNo || 1;
 
-            // Stop early if we already have enough data
-            if (saved >= RESULTS_WANTED && label !== 'LIST') return;
+            // Early exit if quota reached
+            if (saved >= RESULTS_WANTED) {
+                crawlerLog.info(`✅ Quota reached (${saved}/${RESULTS_WANTED}), skipping ${request.url}`);
+                return;
+            }
 
-            // ---------- LIST PAGES ----------
+            // ====================
+            // LIST PAGE HANDLER
+            // ====================
             if (label === 'LIST') {
-                if (saved >= RESULTS_WANTED) {
-                    crawlerLog.info(
-                        `Already saved ${saved} >= ${RESULTS_WANTED}, skipping list page ${request.url}`,
-                    );
-                    return;
-                }
-
+                stats.listPagesProcessed++;
+                
                 const links = findJobLinks($, request.url);
                 crawlerLog.info(
-                    `LIST ${request.url} -> found ${links.length} job links (saved: ${saved}/${RESULTS_WANTED})`,
+                    `📋 LIST page ${pageNo}: Found ${links.length} jobs | Saved: ${saved}/${RESULTS_WANTED} | URL: ${request.url}`
                 );
 
                 if (collectDetails) {
                     const remaining = RESULTS_WANTED - saved;
                     const toEnqueue = links.slice(0, Math.max(0, remaining));
-                    if (toEnqueue.length) {
+                    
+                    if (toEnqueue.length > 0) {
                         await enqueueLinks({
                             urls: toEnqueue,
                             userData: { label: 'DETAIL' },
                         });
+                        crawlerLog.info(`➕ Enqueued ${toEnqueue.length} detail pages`);
                     }
                 } else {
+                    // Save URLs only without details
                     const remaining = RESULTS_WANTED - saved;
                     const toPush = links.slice(0, Math.max(0, remaining));
-                    if (toPush.length) {
+                    
+                    if (toPush.length > 0) {
                         await Dataset.pushData(
-                            toPush.map((u) => ({ url: u, _source: 'xing.com' })),
+                            toPush.map((u) => ({ 
+                                url: u, 
+                                _source: 'xing.com',
+                                scraped_at: new Date().toISOString() 
+                            }))
                         );
                         saved += toPush.length;
+                        stats.itemsSaved = saved;
+                        crawlerLog.info(`💾 Saved ${toPush.length} job URLs (total: ${saved})`);
                     }
                 }
 
+                // Pagination with smart stopping
                 if (saved < RESULTS_WANTED && pageNo < MAX_PAGES) {
                     const next = findNextPage($, request.url);
                     if (next) {
@@ -345,114 +458,105 @@ Actor.main(async () => {
                             urls: [next],
                             userData: { label: 'LIST', pageNo: pageNo + 1 },
                         });
+                        crawlerLog.info(`➡️ Next page enqueued: Page ${pageNo + 1}`);
+                    } else {
+                        crawlerLog.info(`🏁 No more pages found. Stopping pagination.`);
                     }
+                } else {
+                    crawlerLog.info(`🛑 Stopping pagination: saved=${saved}, pageNo=${pageNo}`);
                 }
 
                 return;
             }
 
-            // ---------- DETAIL PAGES ----------
+            // ====================
+            // DETAIL PAGE HANDLER
+            // ====================
             if (label === 'DETAIL') {
                 if (saved >= RESULTS_WANTED) return;
+
+                stats.detailPagesProcessed++;
 
                 try {
                     const json = extractFromJsonLd($);
                     const data = json || {};
 
-                    // Title
+                    // Title extraction
                     if (!data.title) {
                         data.title = normalizeText(
-                            $('h1, [data-testid="job-title"], .job-title').first().text(),
+                            $('h1, [data-testid="job-title"], .job-title, [class*="job-title"]').first().text()
                         );
                     }
 
-                    // Company
+                    // Company extraction
                     if (!data.company) {
                         const companyEl = $(
-                            '[data-testid="company-name"], .company-name, [class*="company"]',
+                            '[data-testid="company-name"], .company-name, [class*="company-name"], [class*="employer"]'
                         ).first();
                         data.company = normalizeText(companyEl.text());
                     }
 
-                    // Description HTML / text
+                    // Description
                     if (!data.description_html) {
                         const desc = $(
-                            '[data-testid="job-description"], [class*="job-description"], .description, article',
+                            '[data-testid="job-description"], [class*="job-description"], .description, article, [class*="job-content"]'
                         ).first();
                         data.description_html = desc && desc.length ? String(desc.html()).trim() : null;
                     }
-                    data.description_text = data.description_html
-                        ? cleanText(data.description_html)
-                        : null;
+                    data.description_text = data.description_html ? cleanText(data.description_html) : null;
 
                     // Location
                     if (!data.location) {
                         const locEl = $(
-                            '[data-testid="job-location"], [class*="location"], .location',
+                            '[data-testid="job-location"], [class*="location"], .location'
                         ).first();
                         data.location = normalizeText(locEl.text());
                     }
 
-                    // ----- Salary -----
+                    // Salary extraction with multiple selectors
                     if (!data.salary) {
-                        const salaryGeneric = $(
-                            '[data-testid="salary"], [class*="salary"]',
-                        ).first();
+                        let rawSalaryText = '';
+                        
+                        // Try generic selectors first
+                        const salaryGeneric = $('[data-testid="salary"], [class*="salary"]').first();
+                        rawSalaryText = salaryGeneric.text() || '';
 
-                        let rawSalaryText = salaryGeneric.text() || '';
-
+                        // Try specific Xing selectors
                         if (!rawSalaryText) {
-                            const salarySelector =
-                                'span.body-copy-styles__BodyCopy-sc-b3916c1b-0.dLgVbf.marker-styles__Text-sc-f046032b-2.bGmnFj';
-                            const salaryCand = $(salarySelector).eq(0);
-                            rawSalaryText = salaryCand.text() || rawSalaryText;
+                            const salarySelector = 'span.body-copy-styles__BodyCopy-sc-b3916c1b-0.dLgVbf.marker-styles__Text-sc-f046032b-2.bGmnFj';
+                            rawSalaryText = $(salarySelector).eq(0).text() || '';
                         }
 
-                        const parsedSalary = parseSalaryText(rawSalaryText);
-                        data.salary =
-                            parsedSalary ||
-                            normalizeText(rawSalaryText) ||
-                            data.salary ||
-                            null;
+                        data.salary = parseSalaryText(rawSalaryText) || normalizeText(rawSalaryText) || null;
                     }
 
-                    // ----- Job type -----
+                    // Job type
                     if (!data.job_type) {
-                        const typeEl = $(
-                            '[data-testid="employment-type"], [class*="employment-type"]',
-                        ).first();
+                        const typeEl = $('[data-testid="employment-type"], [class*="employment-type"]').first();
                         let typeText = normalizeText(typeEl.text());
 
                         if (!typeText) {
-                            const jobTypeSelector =
-                                'span.aria-extended-text__Text-sc-a2c0913c-0.gmPLC';
-                            const jtEl = $(jobTypeSelector).first();
-                            typeText = normalizeText(jtEl.text()) || typeText;
+                            const jobTypeSelector = 'span.aria-extended-text__Text-sc-a2c0913c-0.gmPLC';
+                            typeText = normalizeText($(jobTypeSelector).first().text());
                         }
 
-                        data.job_type = typeText || data.job_type || null;
+                        data.job_type = typeText || null;
                     }
 
-                    // ----- Remote -----
+                    // Remote type
                     if (!data.remote_type) {
-                        const remoteSelector =
-                            'span.body-copy-styles__BodyCopy-sc-b3916c1b-0.dLgVbf.marker-styles__Text-sc-f046032b-2.bGmnFj';
+                        const remoteSelector = 'span.body-copy-styles__BodyCopy-sc-b3916c1b-0.dLgVbf.marker-styles__Text-sc-f046032b-2.bGmnFj';
                         const elems = $(remoteSelector);
-
-                        let remoteText = null;
+                        
                         if (elems.length > 1) {
-                            remoteText = normalizeText(elems.last().text());
+                            data.remote_type = normalizeText(elems.last().text());
                         }
-
-                        data.remote_type = remoteText || data.remote_type || null;
                     }
 
-                    // ----- Job category -----
+                    // Job category
                     if (!data.job_category) {
-                        const jobCategorySelector =
-                            'p.body-copy-styles__BodyCopy-sc-b3916c1b-0.gIutZc.job-intro__AdditionalInfo-sc-5658992b-1.hDMxHz';
-                        const jcEl = $(jobCategorySelector).first();
-                        data.job_category = normalizeText(jcEl.text()) || null;
+                        const jobCategorySelector = 'p.body-copy-styles__BodyCopy-sc-b3916c1b-0.gIutZc.job-intro__AdditionalInfo-sc-5658992b-1.hDMxHz';
+                        data.job_category = normalizeText($(jobCategorySelector).first().text());
                     }
 
                     const item = {
@@ -468,23 +572,71 @@ Actor.main(async () => {
                         description_html: data.description_html || null,
                         description_text: data.description_text || null,
                         url: request.url,
+                        scraped_at: new Date().toISOString(),
                     };
 
                     await Dataset.pushData(item);
                     saved++;
+                    stats.itemsSaved = saved;
+
+                    crawlerLog.info(
+                        `✅ Saved job [${saved}/${RESULTS_WANTED}]: ${item.title} at ${item.company}`
+                    );
+
+                    // Log missing fields for debugging
+                    const missingFields = [];
+                    if (!item.salary) missingFields.push('salary');
+                    if (!item.job_type) missingFields.push('job_type');
+                    if (!item.remote) missingFields.push('remote');
+                    if (!item.job_category) missingFields.push('job_category');
+                    
+                    if (missingFields.length > 0) {
+                        crawlerLog.debug(`⚠️ Missing fields: ${missingFields.join(', ')} | ${request.url}`);
+                    }
+
                 } catch (err) {
-                    crawlerLog.error(`DETAIL ${request.url} failed: ${err.message}`);
+                    stats.errors++;
+                    crawlerLog.error(`❌ DETAIL extraction failed: ${request.url}`, { error: err.message });
                 }
             }
         },
     });
 
-    await crawler.run(
-        initial.map((u) => ({
-            url: u,
-            userData: { label: 'LIST', pageNo: 1 },
-        })),
-    );
+    // ====================
+    // RUN CRAWLER
+    // ====================
 
-    log.info(`Finished. Saved ${saved} items`);
+    log.info('🏃 Starting crawler...');
+    await crawler.run();
+
+    // ====================
+    // FINAL STATISTICS
+    // ====================
+
+    const duration = (Date.now() - stats.startTime) / 1000;
+    const avgRequestTime = stats.averageRequestTime.length > 0
+        ? (stats.averageRequestTime.reduce((a, b) => a + b, 0) / stats.averageRequestTime.length).toFixed(0)
+        : 0;
+    const itemsPerMinute = duration > 0 ? ((stats.itemsSaved / duration) * 60).toFixed(2) : 0;
+
+    log.info('📊 FINAL STATISTICS', {
+        duration: `${duration.toFixed(1)}s`,
+        itemsSaved: stats.itemsSaved,
+        listPages: stats.listPagesProcessed,
+        detailPages: stats.detailPagesProcessed,
+        errors: stats.errors,
+        blockedRequests: stats.blockedRequests,
+        avgRequestTime: `${avgRequestTime}ms`,
+        itemsPerMinute: itemsPerMinute,
+        efficiency: `${((stats.itemsSaved / (stats.detailPagesProcessed || 1)) * 100).toFixed(1)}%`,
+    });
+
+    // Save final state
+    await kvStore.setValue('STATE', {
+        saved: stats.itemsSaved,
+        completedAt: new Date().toISOString(),
+        stats,
+    });
+
+    log.info(`✨ Scraping completed! Saved ${stats.itemsSaved} jobs in ${duration.toFixed(1)}s`);
 });
