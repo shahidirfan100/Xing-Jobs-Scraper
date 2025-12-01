@@ -1,5 +1,5 @@
 // Xing Jobs scraper - CheerioCrawler implementation (production-ready)
-// NOTE: Uses Crawlee's `sleep` instead of `Actor.sleep` to avoid runtime errors.
+// Uses Crawlee's `sleep` (no Actor.sleep) and parses salary into a clean string.
 
 import { Actor, log } from 'apify';
 import { CheerioCrawler, Dataset, sleep } from 'crawlee';
@@ -46,6 +46,47 @@ Actor.main(async () => {
     const normalizeText = (str) => {
         if (!str) return null;
         return String(str).replace(/\s+/g, ' ').trim() || null;
+    };
+
+    // --- NEW: salary text parser to remove messy wording and extract numbers ---
+    const parseSalaryText = (raw) => {
+        if (!raw) return null;
+
+        let text = String(raw).replace(/\s+/g, ' ').trim();
+
+        // Strip everything before first currency sign (removes "Salary forecastHow forecasts are calculated")
+        const firstCurrencyIndex = text.search(/[€£$]/);
+        if (firstCurrencyIndex > 0) {
+            text = text.slice(firstCurrencyIndex).trim();
+        }
+
+        // Grab all currency-like amounts: €52,500, €44.500, etc.
+        const matches = text.match(/[€£$]\s?\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?/g);
+        if (!matches || !matches.length) {
+            // If we can't parse, just return the cleaned text as a last resort
+            return text;
+        }
+
+        // Deduplicate while preserving order
+        const uniques = Array.from(new Set(matches));
+
+        if (uniques.length === 1) {
+            // Single amount: just return it
+            return uniques[0];
+        }
+
+        if (uniques.length === 2) {
+            // Two amounts: assume range
+            const [min, max] = uniques;
+            return `${min}–${max}`;
+        }
+
+        // 3+ amounts: commonly [avg, min, max] pattern
+        const avg = uniques[0];
+        const min = uniques[1];
+        const max = uniques[uniques.length - 1];
+
+        return `${avg} avg, range ${min}–${max}`;
     };
 
     const buildStartUrl = (kw, loc, disc) => {
@@ -136,7 +177,6 @@ Actor.main(async () => {
     }
 
     function findNextPage($, base) {
-        // Generic "Show more" or pagination
         const showMore = $('button')
             .filter((_, el) => /show\s+more/i.test($(el).text()))
             .first();
@@ -147,7 +187,6 @@ Actor.main(async () => {
             return currentUrl.href;
         }
 
-        // Fallback: data-testid pager links (if present)
         const nextLink = $('a[aria-label*="Next"], a[rel="next"]').first();
         if (nextLink.length) {
             const abs = toAbs(nextLink.attr('href'), base);
@@ -186,7 +225,6 @@ Actor.main(async () => {
 
         requestHandlerTimeoutSecs: 60,
 
-        // ---- Proper Crawlee-style preNavigation hook (using `sleep`) ----
         preNavigationHooks: [
             async ({ session }, gotOptions) => {
                 const ua =
@@ -208,7 +246,6 @@ Actor.main(async () => {
                     Pragma: 'no-cache',
                 };
 
-                // Human-like jitter, using Crawlee's sleep
                 const delayMs = 150 + Math.random() * 450;
                 await sleep(delayMs);
             },
@@ -303,22 +340,28 @@ Actor.main(async () => {
                         data.location = normalizeText(locEl.text());
                     }
 
-                    // ----- Salary (your selector as fallback) -----
+                    // ----- Salary (use parser to make it clean) -----
                     if (!data.salary) {
                         const salaryGeneric = $(
                             '[data-testid="salary"], [class*="salary"]',
                         ).first();
-                        let salaryText = normalizeText(salaryGeneric.text());
 
-                        // Specific CSS selector you provided
-                        if (!salaryText) {
+                        let rawSalaryText = salaryGeneric.text() || '';
+
+                        // Specific CSS selector you provided, first element = salary
+                        if (!rawSalaryText) {
                             const salarySelector =
                                 'span.body-copy-styles__BodyCopy-sc-b3916c1b-0.dLgVbf.marker-styles__Text-sc-f046032b-2.bGmnFj';
-                            const salaryCand = $(salarySelector).eq(0); // first element assumed salary
-                            salaryText = normalizeText(salaryCand.text()) || salaryText;
+                            const salaryCand = $(salarySelector).eq(0);
+                            rawSalaryText = salaryCand.text() || rawSalaryText;
                         }
 
-                        data.salary = salaryText || data.salary || null;
+                        const parsedSalary = parseSalaryText(rawSalaryText);
+                        data.salary =
+                            parsedSalary ||
+                            normalizeText(rawSalaryText) ||
+                            data.salary ||
+                            null;
                     }
 
                     // ----- Job type (your selector as fallback) -----
@@ -346,7 +389,6 @@ Actor.main(async () => {
 
                         let remoteText = null;
                         if (elems.length > 1) {
-                            // heuristic: last occurrence is "Remote / Hybrid / On-site"
                             remoteText = normalizeText(elems.last().text());
                         }
 
@@ -366,7 +408,7 @@ Actor.main(async () => {
                         company: data.company || null,
                         discipline: discipline || null,
                         location: data.location || null,
-                        salary: data.salary || null,
+                        salary: data.salary || null,        // <- clean, readable salary
                         job_type: data.job_type || null,
                         remote: data.remote_type || null,
                         job_category: data.job_category || null,
