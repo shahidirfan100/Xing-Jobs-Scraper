@@ -3,6 +3,10 @@
   "location": "Berlin",
   "discipline": "Technology",
   "results_wanted": 20,
-  "max_pages": 5,
-  "collectDetails": true
+  "max_pages": 20,
+  "collectDetails": true,
+  "proxyConfiguration": {
+    "useApifyProxy": true,
+    "apifyProxyGroups": ["RESIDENTIAL"]
+  }
 }

@@ -23,6 +23,12 @@
       "description": "City or region to filter jobs by location, e.g., 'Berlin', 'Munich', 'Hamburg'. Leave empty for all locations.",
       "editor": "textfield"
     },
+    "discipline": {
+      "title": "Discipline",
+      "type": "string",
+      "description": "Professional field or industry category, e.g., 'Technology', 'Marketing', 'Finance', 'Engineering'.",
+      "editor": "textfield"
+    },
     "collectDetails": {
       "title": "Collect job details",
       "type": "boolean",
@@ -35,7 +41,7 @@
       "type": "integer",
       "description": "The maximum number of job listings to collect. Set to a specific number to limit results or leave at default for comprehensive scraping.",
       "minimum": 1,
-      "default": 100,
+      "default": 20,
       "editor": "number"
     },
     "max_pages": {
@@ -44,7 +50,7 @@
       "description": "Safety limit on the number of search result pages to visit. Prevents excessive scraping on large result sets.",
       "minimum": 1,
       "editor": "number",
-      "default": 20
+      "default": 50
     },
     "proxyConfiguration": {
       "title": "Proxy configuration",
@@ -55,13 +61,6 @@
         "useApifyProxy": true,
         "apifyProxyGroups": ["RESIDENTIAL"]
       }
-    },
-    "dedupe": {
-      "title": "Deduplicate results",
-      "type": "boolean",
-      "description": "Automatically remove duplicate job URLs from results using in-memory deduplication.",
-      "editor": "checkbox",
-      "default": true
     }
   },
   "required": [],
