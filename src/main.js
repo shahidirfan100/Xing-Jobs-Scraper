@@ -104,13 +104,12 @@ async function main() {
                                       null
                                     : null,
                                 job_type: e.employmentType || null,
-                                remote_type: e.jobLocationType || null, // TELECOMMUTE, HYBRID, etc.
+                                remote_type: e.jobLocationType || null,
+                                job_category: null, // JSON-LD rarely includes it
                             };
                         }
                     }
-                } catch (e) {
-                    // ignore JSON-LD parsing errors
-                }
+                } catch (e) {}
             }
             return null;
         }
@@ -120,7 +119,6 @@ async function main() {
             $('a[href]').each((_, a) => {
                 const href = $(a).attr('href');
                 if (!href) return;
-                // Xing job URLs pattern: /jobs/[location]-[title]-[id] or /jobs/homeoffice-[title]-[id]
                 if (/\/jobs\/[a-z0-9-]+-\d+/i.test(href)) {
                     const abs = toAbs(href, base);
                     if (abs) links.add(abs);
@@ -130,12 +128,10 @@ async function main() {
         }
 
         function findNextPage($, base) {
-            // Xing uses "Show more" button or pagination
             const showMore = $('button')
                 .filter((_, el) => /show\s+more/i.test($(el).text()))
                 .first();
             if (showMore.length) {
-                // Construct next page URL based on page param
                 const currentUrl = new URL(base);
                 const currentPage = parseInt(currentUrl.searchParams.get('page') || '1', 10);
                 currentUrl.searchParams.set('page', String(currentPage + 1));
@@ -145,7 +141,6 @@ async function main() {
         }
 
         const USER_AGENTS = [
-            // A small realistic rotation – add more if you like
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
             'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
             'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36',
@@ -157,75 +152,53 @@ async function main() {
             proxyConfiguration: proxyConf,
             maxRequestRetries: 3,
             useSessionPool: true,
-            sessionPoolOptions: {
-                maxPoolSize: 100,
-                sessionOptions: {
-                    maxUsageCount: 50,
-                },
-            },
             maxConcurrency: 10,
             minConcurrency: 5,
-            autoscaledPoolOptions: {
-                desiredConcurrency: 10,
-            },
+            autoscaledPoolOptions: { desiredConcurrency: 10 },
             requestHandlerTimeoutSecs: 60,
-            // Stealth: tweak headers & small delay before each request
+
             preNavigationHooks: [
                 async ({ request, session }, gotOptions) => {
-                    // Rotate User-Agent per session or request
                     const ua =
                         (session && session.userData && session.userData.ua) ||
                         pickRandomUserAgent();
                     if (session && session.userData && !session.userData.ua) {
                         session.userData.ua = ua;
                     }
-
                     gotOptions.headers = {
                         ...(gotOptions.headers || {}),
                         'User-Agent': ua,
                         'Accept-Language': 'en-US,en;q=0.9',
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                        'Accept':
+                            'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
                         'Upgrade-Insecure-Requests': '1',
                         'Cache-Control': 'no-cache',
                         Pragma: 'no-cache',
                     };
-
-                    // Human-like jitter
-                    const delayMs = 150 + Math.random() * 450;
-                    await Actor.sleep(delayMs);
+                    await Actor.sleep(150 + Math.random() * 450);
                 },
             ],
+
             failedRequestHandler: async ({ request, error }) => {
                 log.error(
                     `Request ${request.url} failed too many times. Last error: ${error?.message}`,
                 );
             },
+
             async requestHandler({ request, $, enqueueLinks, log: crawlerLog }) {
                 const label = request.userData?.label || 'LIST';
                 const pageNo = request.userData?.pageNo || 1;
 
                 if (label === 'LIST') {
                     const links = findJobLinks($, request.url);
-                    crawlerLog.info(`LIST ${request.url} -> found ${links.length} job links`);
+                    crawlerLog.info(`LIST ${request.url} -> ${links.length} jobs`);
 
                     if (collectDetails) {
                         const remaining = RESULTS_WANTED - saved;
-                        const toEnqueue = links.slice(0, Math.max(0, remaining));
-                        if (toEnqueue.length) {
-                            await enqueueLinks({
-                                urls: toEnqueue,
-                                userData: { label: 'DETAIL' },
-                            });
-                        }
-                    } else {
-                        const remaining = RESULTS_WANTED - saved;
-                        const toPush = links.slice(0, Math.max(0, remaining));
-                        if (toPush.length) {
-                            await Dataset.pushData(
-                                toPush.map((u) => ({ url: u, _source: 'xing.com' })),
-                            );
-                            saved += toPush.length;
-                        }
+                        await enqueueLinks({
+                            urls: links.slice(0, remaining),
+                            userData: { label: 'DETAIL' },
+                        });
                     }
 
                     if (saved < RESULTS_WANTED && pageNo < MAX_PAGES) {
@@ -240,7 +213,7 @@ async function main() {
                     return;
                 }
 
-                // DETAIL pages
+                // DETAIL
                 if (label === 'DETAIL') {
                     if (saved >= RESULTS_WANTED) return;
                     try {
@@ -250,26 +223,25 @@ async function main() {
                         // Title
                         if (!data.title) {
                             data.title = normalizeText(
-                                $('h1, [data-testid="job-title"], .job-title')
-                                    .first()
-                                    .text(),
+                                $('h1, [data-testid="job-title"], .job-title').first().text(),
                             );
                         }
 
                         // Company
                         if (!data.company) {
-                            const companyEl = $(
-                                '[data-testid="company-name"], .company-name, [class*="company"]',
-                            ).first();
-                            data.company = normalizeText(companyEl.text());
+                            data.company = normalizeText(
+                                $('[data-testid="company-name"], .company-name')
+                                    .first()
+                                    .text(),
+                            );
                         }
 
-                        // Description HTML / text
+                        // Description
                         if (!data.description_html) {
                             const desc = $(
-                                '[data-testid="job-description"], [class*="job-description"], .description, article',
+                                '[data-testid="job-description"], .description, article',
                             ).first();
-                            data.description_html = desc && desc.length ? String(desc.html()).trim() : null;
+                            data.description_html = desc.html() || null;
                         }
                         data.description_text = data.description_html
                             ? cleanText(data.description_html)
@@ -277,93 +249,59 @@ async function main() {
 
                         // Location
                         if (!data.location) {
-                            const locEl = $(
-                                '[data-testid="job-location"], [class*="location"], .location',
-                            ).first();
-                            data.location = normalizeText(locEl.text());
+                            data.location = normalizeText(
+                                $('[data-testid="job-location"], .location').first().text(),
+                            );
                         }
 
-                        // Salary – your CSS selector fallback
+                        // Salary
                         if (!data.salary) {
-                            // Generic salary selectors
-                            const salaryElGeneric = $(
-                                '[data-testid="salary"], [class*="salary"]',
-                            ).first();
-                            let salaryText = normalizeText(salaryElGeneric.text());
-
-                            // Specific CSS selector you provided
-                            if (!salaryText) {
-                                const salarySelector =
-                                    'span.body-copy-styles__BodyCopy-sc-b3916c1b-0.dLgVbf.marker-styles__Text-sc-f046032b-2.bGmnFj';
-                                const salaryCand = $(salarySelector).eq(0); // first occurrence
-                                salaryText = normalizeText(salaryCand.text()) || salaryText;
-                            }
-
-                            data.salary = salaryText || data.salary || null;
-                        }
-
-                        // Job type – your CSS selector fallback
-                        if (!data.job_type) {
-                            // Generic job type selectors
-                            const typeEl = $(
-                                '[data-testid="employment-type"], [class*="employment-type"]',
-                            ).first();
-                            let typeText = normalizeText(typeEl.text());
-
-                            // Specific CSS selector you provided for job type
-                            if (!typeText) {
-                                const jobTypeSelector =
-                                    'span.aria-extended-text__Text-sc-a2c0913c-0.gmPLC';
-                                const jtEl = $(jobTypeSelector).first();
-                                typeText = normalizeText(jtEl.text()) || typeText;
-                            }
-
-                            data.job_type = typeText || data.job_type || null;
-                        }
-
-                        // Remote type (e.g. Remote, Hybrid, On-site) – using your selector
-                        if (!data.remote_type) {
-                            // Schema.org jobLocationType already handled above as json.remote_type
-                            const remoteSelector =
+                            const sel =
                                 'span.body-copy-styles__BodyCopy-sc-b3916c1b-0.dLgVbf.marker-styles__Text-sc-f046032b-2.bGmnFj';
-
-                            const elems = $(remoteSelector);
-                            let remoteText = null;
-
-                            // Heuristic: often salary and remote are rendered in the same style,
-                            // so take the second or last occurrence as "remote" if available.
-                            if (elems.length > 1) {
-                                remoteText = normalizeText(elems.last().text());
-                            }
-
-                            data.remote_type = remoteText || data.remote_type || null;
+                            data.salary = normalizeText($(sel).first().text()) || null;
                         }
 
-                        const item = {
+                        // Job type
+                        if (!data.job_type) {
+                            const sel =
+                                'span.aria-extended-text__Text-sc-a2c0913c-0.gmPLC';
+                            data.job_type = normalizeText($(sel).first().text()) || null;
+                        }
+
+                        // Remote
+                        if (!data.remote_type) {
+                            const sel =
+                                'span.body-copy-styles__BodyCopy-sc-b3916c1b-0.dLgVbf.marker-styles__Text-sc-f046032b-2.bGmnFj';
+                            if ($(sel).length > 1) {
+                                data.remote_type = normalizeText($(sel).last().text());
+                            }
+                        }
+
+                        // ⭐ NEW — Job Category
+                        if (!data.job_category) {
+                            const sel =
+                                'p.body-copy-styles__BodyCopy-sc-b3916c1b-0.gIutZc.job-intro__AdditionalInfo-sc-5658992b-1.hDMxHz';
+                            data.job_category = normalizeText($(sel).first().text()) || null;
+                        }
+
+                        await Dataset.pushData({
                             title: data.title || null,
                             company: data.company || null,
                             discipline: discipline || null,
                             location: data.location || null,
                             salary: data.salary || null,
                             job_type: data.job_type || null,
-                            remote: data.remote_type || null, // exposed field for remote / hybrid / onsite
+                            remote: data.remote_type || null,
+                            job_category: data.job_category || null,
                             date_posted: data.date_posted || null,
                             description_html: data.description_html || null,
                             description_text: data.description_text || null,
                             url: request.url,
-                        };
+                        });
 
-                        await Dataset.pushData(item);
                         saved++;
-
-                        // Optional debugging logs (can be downgraded to debug)
-                        if (!item.salary || !item.job_type || !item.remote) {
-                            crawlerLog.debug(
-                                `DETAIL missing some fields at ${request.url} :: salary="${item.salary}" job_type="${item.job_type}" remote="${item.remote}"`,
-                            );
-                        }
                     } catch (err) {
-                        crawlerLog.error(`DETAIL ${request.url} failed: ${err.message}`);
+                        crawlerLog.error(`DETAIL ${request.url} error: ${err.message}`);
                     }
                 }
             },
@@ -375,6 +313,7 @@ async function main() {
                 userData: { label: 'LIST', pageNo: 1 },
             })),
         );
+
         log.info(`Finished. Saved ${saved} items`);
     } finally {
         await Actor.exit();
