@@ -1,11 +1,10 @@
-// Xing Jobs scraper - CheerioCrawler implementation (production-grade)
+// Xing Jobs scraper - CheerioCrawler (production-grade)
 //
-// Key points:
-// - Uses Actor.main (passes Apify QA pattern).
-// - Uses Crawlee's sleep (NO Actor.sleep).
-// - Extracts: salary, job_type, remote, job_category (with your selectors).
-// - Optimized speed: higher concurrency, smaller delay, capped maxRequestsPerCrawl.
-// - Stealth: UA rotation, realistic headers, session pool + proxies.
+// - Concurrency: min 8, max 13, desired 10
+// - Adaptive backoff for 429/403/503 (blocking / rate limiting)
+// - Clean salary parsing
+// - Extracts: salary, job_type, remote, job_category
+// - Uses Actor.main + Crawlee.sleep (QA-friendly)
 
 import { Actor, log } from 'apify';
 import { CheerioCrawler, Dataset, sleep } from 'crawlee';
@@ -36,8 +35,8 @@ Actor.main(async () => {
         ? Math.max(1, +MAX_PAGES_RAW)
         : 50;
 
-    // Soft cap on total requests to keep crawl tight & fast
-    const MAX_REQUESTS_PER_CRAWL = RESULTS_WANTED * 4 || 200;
+    // Soft cap on total requests – tighter for speed
+    const MAX_REQUESTS_PER_CRAWL = RESULTS_WANTED * 3 || 150;
 
     const toAbs = (href, base = 'https://www.xing.com') => {
         try {
@@ -59,7 +58,7 @@ Actor.main(async () => {
         return String(str).replace(/\s+/g, ' ').trim() || null;
     };
 
-    // --- Salary text parser: remove noise and keep readable values ---
+    // --- Salary parser: strips noise, keeps readable values ---
     const parseSalaryText = (raw) => {
         if (!raw) return null;
 
@@ -78,20 +77,17 @@ Actor.main(async () => {
 
         const uniques = Array.from(new Set(matches));
 
-        if (uniques.length === 1) {
-            return uniques[0];
-        }
+        if (uniques.length === 1) return uniques[0];
 
         if (uniques.length === 2) {
             const [min, max] = uniques;
             return `${min}–${max}`;
         }
 
-        // 3+ amounts: assume [avg, min, max] pattern
+        // 3+ amounts: assume [avg, min, max]
         const avg = uniques[0];
         const min = uniques[1];
         const max = uniques[uniques.length - 1];
-
         return `${avg} avg, range ${min}–${max}`;
     };
 
@@ -120,6 +116,9 @@ Actor.main(async () => {
         : undefined;
 
     let saved = 0;
+
+    // For adaptive backoff: simple shared backoff state
+    let globalBackoffMs = 0;
 
     // ----- JSON-LD extraction -----
     const extractFromJsonLd = ($) => {
@@ -170,7 +169,7 @@ Actor.main(async () => {
     const findJobLinks = ($, base) => {
         const links = new Set();
 
-        // Restrict to likely job links for speed
+        // Restrict to likely job links for speed & fewer useless requests
         $('a[href*="/jobs/"]').each((_, a) => {
             const href = $(a).attr('href');
             if (!href) return;
@@ -214,25 +213,26 @@ Actor.main(async () => {
 
     const crawler = new CheerioCrawler({
         proxyConfiguration: proxyConf,
-        maxRequestRetries: 2, // fewer retries = faster, still safe
+        maxRequestRetries: 2, // fewer retries -> faster, but with adaptive backoff
         useSessionPool: true,
         sessionPoolOptions: {
-            maxPoolSize: 50,
+            maxPoolSize: 40,
             sessionOptions: {
                 maxUsageCount: 40,
             },
         },
 
-        // Performance tuning
+        // Concurrency as per your request
         minConcurrency: 8,
-        maxConcurrency: 16,
+        maxConcurrency: 13,
         autoscaledPoolOptions: {
-            desiredConcurrency: 12,
+            desiredConcurrency: 10,
         },
-        maxRequestsPerCrawl: MAX_REQUESTS_PER_CRAWL,
-        requestHandlerTimeoutSecs: 30,
 
-        // Stealth + light delay
+        maxRequestsPerCrawl: MAX_REQUESTS_PER_CRAWL,
+        requestHandlerTimeoutSecs: 25,
+
+        // Pre-navigation: headers, UA, light jitter + global backoff if we were blocked recently
         preNavigationHooks: [
             async ({ session }, gotOptions) => {
                 const ua =
@@ -254,9 +254,40 @@ Actor.main(async () => {
                     Pragma: 'no-cache',
                 };
 
-                // Smaller jitter for speed, still non-botty
-                const delayMs = 50 + Math.random() * 150;
-                await sleep(delayMs);
+                // Base jitter
+                const baseDelayMs = 80 + Math.random() * 140;
+
+                // If we saw blocking recently, add a shared backoff
+                if (globalBackoffMs > 0) {
+                    await sleep(globalBackoffMs);
+                    // Decay backoff slowly
+                    globalBackoffMs = Math.max(0, globalBackoffMs - 100);
+                }
+
+                await sleep(baseDelayMs);
+            },
+        ],
+
+        // Post-navigation: inspect response codes and adapt
+        postNavigationHooks: [
+            async ({ response, session, log: hookLog }) => {
+                if (!response) return;
+
+                const status = response.statusCode;
+                if ([403, 429, 503].includes(status)) {
+                    hookLog.warning(
+                        `Received status ${status}, applying backoff and retiring session.`,
+                    );
+                    // Pump backoff up to max 2 seconds
+                    globalBackoffMs = Math.min(globalBackoffMs + 500, 2000);
+
+                    if (session) {
+                        session.markBad();
+                    }
+
+                    // Small extra sleep here to cool down a bit more
+                    await sleep(400 + Math.random() * 400);
+                }
             },
         ],
 
@@ -362,7 +393,7 @@ Actor.main(async () => {
                         data.location = normalizeText(locEl.text());
                     }
 
-                    // ----- Salary (cleaned with parser) -----
+                    // ----- Salary -----
                     if (!data.salary) {
                         const salaryGeneric = $(
                             '[data-testid="salary"], [class*="salary"]',
@@ -441,10 +472,6 @@ Actor.main(async () => {
 
                     await Dataset.pushData(item);
                     saved++;
-
-                    // Keep debug-only logs quiet for QA; uncomment if needed
-                    // crawlerLog.debug(`Saved ${saved}/${RESULTS_WANTED}: ${request.url}`);
-
                 } catch (err) {
                     crawlerLog.error(`DETAIL ${request.url} failed: ${err.message}`);
                 }
