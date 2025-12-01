@@ -277,11 +277,11 @@ Actor.main(async () => {
             },
         },
 
-        // Concurrency: Conservative settings to avoid blocking
-        minConcurrency: isDatacenterProxy ? 8 : 6,
-        maxConcurrency: isDatacenterProxy ? 14 : 12,
+        // Concurrency: Balanced for speed and stealth across all proxy types
+        minConcurrency: 8,
+        maxConcurrency: 12,
         autoscaledPoolOptions: {
-            desiredConcurrency: isDatacenterProxy ? 10 : 8,
+            desiredConcurrency: 10,
             scaleUpStepRatio: 0.1,
             scaleDownStepRatio: 0.05,
         },
